@@ -18,10 +18,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-#[allow(deprecated)]
-use solana_entry::entry::Entry;
-
-use crate::decoder::DecodedTx;
+use crate::decoder::{DecodedTx, Entry};
 use crate::fan_in::TxSource;
 use crate::metrics;
 use crate::source_metrics::SourceMetrics;
@@ -151,13 +148,11 @@ async fn run_jito_shredstream(
         let slot = msg.slot;
 
         // The proxy sends bincode-serialized Vec<solana_entry::entry::Entry>
-        #[allow(deprecated)]
         let entries: Vec<Entry> = match bincode::deserialize(&msg.entries) {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        #[allow(deprecated)]
         for entry in entries {
             for transaction in entry.transactions {
                 metrics.txs_decoded.fetch_add(1, Relaxed);

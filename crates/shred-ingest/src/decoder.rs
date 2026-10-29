@@ -19,6 +19,15 @@ use std::sync::Arc;
 use crate::metrics;
 use crate::source_metrics::{SlotOutcome, SlotStats, SourceMetrics};
 
+/// Wire layout of `solana_entry::entry::Entry`. Agave 4.x only implements
+/// wincode for `Entry`, so we mirror it here to keep streaming with bincode.
+#[derive(serde::Deserialize)]
+pub(crate) struct Entry {
+    _num_hashes: u64,
+    _hash: [u8; 32],
+    pub transactions: Vec<VersionedTransaction>,
+}
+
 // ---------------------------------------------------------------------------
 // Raw shred header parsing
 //
@@ -252,62 +261,88 @@ impl SlotState {
     }
 
     /// Try to deserialize entries from accumulated data and extract transactions.
-    #[allow(deprecated)]
     fn try_deserialize(&mut self) -> Vec<VersionedTransaction> {
         let mut txs = Vec::new();
 
-        // ── Phase 1: locate the first Entry boundary ────────────────────────
-        if !self.boundary_scanned {
-            let buf = &self.entry_buf[self.consumed..];
-            if buf.len() < 48 {
-                return txs;
-            }
-
-            let mut found_at: Option<usize> = None;
-            for off in 0..buf.len().saturating_sub(47) {
-                let tx_count = u64::from_le_bytes(buf[off + 40..off + 48].try_into().unwrap());
-                if tx_count > 512 {
-                    continue;
-                }
-                let mut cur = std::io::Cursor::new(&buf[off..]);
-                if bincode::deserialize_from::<_, solana_entry::entry::Entry>(&mut cur).is_ok() {
-                    found_at = Some(off);
-                    break;
-                }
-            }
-
-            match found_at {
-                Some(off) => {
-                    self.consumed += off;
-                    self.boundary_scanned = true;
-                }
-                None => {
+        loop {
+            // ── Phase 1: locate the first Entry boundary ────────────────────
+            if !self.boundary_scanned {
+                let buf = &self.entry_buf[self.consumed..];
+                if buf.len() < 48 {
                     return txs;
                 }
-            }
-        }
 
-        // ── Phase 2: stream-deserialize complete Entries ─────────────────────
-        let buf = &self.entry_buf[self.consumed..];
-        if buf.is_empty() {
-            return txs;
-        }
-        let mut cursor = std::io::Cursor::new(buf);
-        loop {
-            let pos_before = cursor.position();
-            match bincode::deserialize_from::<_, solana_entry::entry::Entry>(&mut cursor) {
-                Ok(entry) => {
-                    txs.extend(entry.transactions);
+                let mut found_at: Option<usize> = None;
+                for off in 0..buf.len().saturating_sub(47) {
+                    let tx_count = u64::from_le_bytes(buf[off + 40..off + 48].try_into().unwrap());
+                    if tx_count > 512 {
+                        continue;
+                    }
+                    // Anchor only on an Entry with transactions, each carrying at
+                    // least one signature: zero-filled bytes easily parse as an
+                    // empty Entry or an unsigned transaction. Skipping real empty
+                    // (tick) Entries here loses nothing.
+                    let mut cur = std::io::Cursor::new(&buf[off..]);
+                    if bincode::deserialize_from::<_, Entry>(&mut cur).is_ok_and(|e| {
+                        !e.transactions.is_empty()
+                            && e.transactions.iter().all(|t| !t.signatures.is_empty())
+                    }) {
+                        found_at = Some(off);
+                        break;
+                    }
                 }
-                Err(_) => {
-                    cursor.set_position(pos_before);
-                    break;
+
+                match found_at {
+                    Some(off) => {
+                        self.consumed += off;
+                        self.boundary_scanned = true;
+                    }
+                    None => {
+                        return txs;
+                    }
                 }
             }
+
+            // ── Phase 2: stream-deserialize complete Entries ─────────────────
+            let buf = &self.entry_buf[self.consumed..];
+            if buf.is_empty() {
+                return txs;
+            }
+            let mut cursor = std::io::Cursor::new(buf);
+            let resync = loop {
+                let pos_before = cursor.position();
+                match bincode::deserialize_from::<_, Entry>(&mut cursor) {
+                    Ok(entry) => {
+                        txs.extend(entry.transactions);
+                    }
+                    Err(e) if is_truncated(&e) => {
+                        // Entry continues in shreds we have not received yet.
+                        cursor.set_position(pos_before);
+                        break false;
+                    }
+                    Err(_) => {
+                        // An entry we cannot read (e.g. a transaction format this
+                        // build does not know). More shreds will not fix it, and
+                        // waiting would drop the rest of the slot, so step past it
+                        // and rescan for the next Entry boundary.
+                        cursor.set_position(pos_before + 1);
+                        break true;
+                    }
+                }
+            };
+            self.consumed += cursor.position() as usize;
+            if !resync {
+                return txs;
+            }
+            self.boundary_scanned = false;
         }
-        self.consumed += cursor.position() as usize;
-        txs
     }
+}
+
+/// True when bincode ran out of bytes, i.e. the entry is incomplete rather than
+/// malformed.
+fn is_truncated(err: &bincode::Error) -> bool {
+    matches!(err.as_ref(), bincode::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 // ---------------------------------------------------------------------------
@@ -951,5 +986,88 @@ mod tests {
             highest_slot = next_slot;
         }
         assert_eq!(highest_slot, 102);
+    }
+
+    use solana_message::{v1, Message, VersionedMessage};
+    use solana_signature::Signature;
+
+    fn tx(seed: u8, message: VersionedMessage) -> VersionedTransaction {
+        VersionedTransaction {
+            signatures: vec![Signature::from([seed; 64])],
+            message,
+        }
+    }
+
+    /// Bincode bytes of one Entry holding `txs`, written field by field.
+    fn entry_bytes(txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1u64.to_le_bytes()); // num_hashes
+        out.extend_from_slice(&[0u8; 32]); // hash
+        out.extend_from_slice(&(txs.len() as u64).to_le_bytes());
+        for t in txs {
+            out.extend_from_slice(t);
+        }
+        out
+    }
+
+    fn legacy_tx_bytes(seed: u8) -> Vec<u8> {
+        bincode::serialize(&tx(seed, VersionedMessage::Legacy(Message::default()))).unwrap()
+    }
+
+    fn slot_with(buf: Vec<u8>) -> SlotState {
+        let mut s = SlotState::new(0);
+        s.set_first_index(0);
+        s.entry_buf = buf;
+        s
+    }
+
+    fn first_sig_bytes(t: &VersionedTransaction) -> [u8; 64] {
+        t.signatures[0].into()
+    }
+
+    #[test]
+    fn test_v1_transaction_decodes() {
+        let v1_tx = tx(9, VersionedMessage::V1(v1::Message::default()));
+        let mut s = slot_with(entry_bytes(&[bincode::serialize(&v1_tx).unwrap()]));
+        let txs = s.try_deserialize();
+        assert_eq!(txs.len(), 1);
+        assert!(matches!(txs[0].message, VersionedMessage::V1(_)));
+    }
+
+    #[test]
+    fn test_unreadable_entry_does_not_drop_rest_of_slot() {
+        // A transaction with an unknown message version (prefix 0xff) cannot be
+        // read no matter how many more shreds arrive. The entries after it must
+        // still be decoded.
+        let mut bad_tx = vec![1u8]; // one signature (short_vec)
+        bad_tx.extend_from_slice(&[0xaa; 64]);
+        bad_tx.push(0xff);
+        bad_tx.extend_from_slice(&[0x11; 40]);
+
+        let mut buf = entry_bytes(&[legacy_tx_bytes(1)]);
+        buf.extend(entry_bytes(&[bad_tx]));
+        buf.extend(entry_bytes(&[legacy_tx_bytes(2)]));
+
+        let mut s = slot_with(buf);
+        let sigs: Vec<[u8; 64]> = s.try_deserialize().iter().map(first_sig_bytes).collect();
+        assert_eq!(sigs, vec![[1u8; 64], [2u8; 64]]);
+    }
+
+    #[test]
+    fn test_incomplete_entry_waits_for_more_shreds() {
+        let first = entry_bytes(&[legacy_tx_bytes(1)]);
+        let second = entry_bytes(&[legacy_tx_bytes(2)]);
+        let split = second.len() / 2;
+
+        let mut buf = first.clone();
+        buf.extend_from_slice(&second[..split]);
+        let mut s = slot_with(buf);
+        assert_eq!(s.try_deserialize().len(), 1);
+        assert_eq!(s.consumed, first.len());
+
+        s.entry_buf.extend_from_slice(&second[split..]);
+        let txs = s.try_deserialize();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(first_sig_bytes(&txs[0]), [2u8; 64]);
     }
 }
