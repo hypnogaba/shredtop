@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crate::decoder::{DecodedTx, Entry};
+use crate::decoder::{read_entry_batch, DecodedTx};
 use crate::fan_in::TxSource;
 use crate::metrics;
 use crate::source_metrics::SourceMetrics;
@@ -147,24 +147,18 @@ async fn run_jito_shredstream(
         let recv_ns = metrics::now_realtime_ns();
         let slot = msg.slot;
 
-        // The proxy sends bincode-serialized Vec<solana_entry::entry::Entry>
-        let entries: Vec<Entry> = match bincode::deserialize(&msg.entries) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries {
-            for transaction in entry.transactions {
-                metrics.txs_decoded.fetch_add(1, Relaxed);
-                let decoded = DecodedTx {
-                    transaction,
-                    slot,
-                    shred_recv_ns: recv_ns,
-                    decode_done_ns: recv_ns,
-                };
-                metrics.txs_emitted.fetch_add(1, Relaxed);
-                let _ = tx.try_send(decoded);
-            }
+        // The proxy sends a serialized Vec<solana_entry::entry::Entry>. Read it
+        // Entry by Entry so one unreadable transaction does not drop the batch.
+        for transaction in read_entry_batch(&msg.entries) {
+            metrics.txs_decoded.fetch_add(1, Relaxed);
+            let decoded = DecodedTx {
+                transaction,
+                slot,
+                shred_recv_ns: recv_ns,
+                decode_done_ns: recv_ns,
+            };
+            metrics.txs_emitted.fetch_add(1, Relaxed);
+            let _ = tx.try_send(decoded);
         }
     }
 

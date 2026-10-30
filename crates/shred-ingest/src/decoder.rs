@@ -2,7 +2,7 @@
 //!
 //! Accepts raw shreds from `ShredReceiver`, accumulates data shred payloads per slot,
 //! flushes contiguous runs into an entry buffer, and deserializes `Entry` structs via
-//! bincode to extract `VersionedTransaction`s.
+//! wincode to extract `VersionedTransaction`s.
 //!
 //! FEC (Reed-Solomon erasure) recovery is implemented for Merkle coding shreds.
 //! When a FEC set accumulates enough shards (data + coding >= num_data), missing
@@ -19,13 +19,119 @@ use std::sync::Arc;
 use crate::metrics;
 use crate::source_metrics::{SlotOutcome, SlotStats, SourceMetrics};
 
-/// Wire layout of `solana_entry::entry::Entry`. Agave 4.x only implements
-/// wincode for `Entry`, so we mirror it here to keep streaming with bincode.
-#[derive(serde::Deserialize)]
-pub(crate) struct Entry {
-    _num_hashes: u64,
-    _hash: [u8; 32],
-    pub transactions: Vec<VersionedTransaction>,
+/// Upper bound on transactions in one Entry. A larger count means we are not
+/// looking at an Entry header.
+const MAX_ENTRY_TXS: u64 = 512;
+
+/// Why an Entry could not be read from the front of a buffer.
+#[derive(Debug, PartialEq)]
+pub(crate) enum EntryError {
+    /// The Entry continues past the end of the buffer.
+    Truncated,
+    /// The bytes are not a readable Entry.
+    Malformed,
+}
+
+/// Read one `solana_entry::entry::Entry` (num_hashes u64, hash [u8; 32],
+/// transaction count u64, transactions) from the front of `buf`.
+///
+/// Transactions are read with wincode: v1 transactions (SIMD-0385) put the
+/// message first and the signatures after it with no length prefix, and only
+/// wincode understands that layout. bincode reads legacy and v0 only.
+///
+/// Returns the transactions and the number of bytes the Entry took.
+pub(crate) fn read_entry(buf: &[u8]) -> Result<(Vec<VersionedTransaction>, usize), EntryError> {
+    if buf.len() < 48 {
+        return Err(EntryError::Truncated);
+    }
+    let count = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+    if count > MAX_ENTRY_TXS {
+        return Err(EntryError::Malformed);
+    }
+    let mut rest = &buf[48..];
+    let mut txs = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        match wincode::deserialize_from::<VersionedTransaction>(&mut rest) {
+            Ok(t) => txs.push(t),
+            Err(wincode::ReadError::Io(wincode::io::ReadError::ReadSizeLimit(_))) => {
+                return Err(EntryError::Truncated)
+            }
+            Err(_) => return Err(EntryError::Malformed),
+        }
+    }
+    Ok((txs, buf.len() - rest.len()))
+}
+
+/// Read a `Vec<Entry>` as the Jito proxy sends it (u64 count, then Entries).
+/// An unreadable Entry is skipped; the Entries after it are still read.
+pub(crate) fn read_entry_batch(buf: &[u8]) -> Vec<VersionedTransaction> {
+    if buf.len() < 8 {
+        return Vec::new();
+    }
+    // The Entry count is not needed: the batch ends where the bytes end.
+    let mut consumed = 0;
+    let mut boundary_scanned = true;
+    decode_entries(&buf[8..], &mut consumed, &mut boundary_scanned)
+}
+
+/// Decode the complete Entries in `buf[*consumed..]` and advance `consumed`
+/// past them. An Entry cut off at the end of `buf` is left for the next call.
+///
+/// When `boundary_scanned` is false, `buf[*consumed..]` may start mid-Entry, so
+/// first scan forward for an Entry header. An unreadable Entry is skipped the
+/// same way: no amount of extra data fixes it, and waiting on it would lose
+/// every Entry after it.
+fn decode_entries(
+    buf: &[u8],
+    consumed: &mut usize,
+    boundary_scanned: &mut bool,
+) -> Vec<VersionedTransaction> {
+    let mut txs = Vec::new();
+
+    loop {
+        // ── Phase 1: locate the first Entry boundary ────────────────────────
+        if !*boundary_scanned {
+            let rest = &buf[*consumed..];
+            if rest.len() < 48 {
+                return txs;
+            }
+
+            // Anchor only on an Entry with transactions, each carrying at
+            // least one signature: zero-filled bytes easily parse as an
+            // empty Entry or an unsigned transaction. Skipping real empty
+            // (tick) Entries here loses nothing.
+            let found_at = (0..rest.len() - 47).find(|&off| {
+                read_entry(&rest[off..]).is_ok_and(|(entry_txs, _)| {
+                    !entry_txs.is_empty() && entry_txs.iter().all(|t| !t.signatures.is_empty())
+                })
+            });
+
+            match found_at {
+                Some(off) => {
+                    *consumed += off;
+                    *boundary_scanned = true;
+                }
+                None => return txs,
+            }
+        }
+
+        // ── Phase 2: decode complete Entries ────────────────────────────────
+        loop {
+            match read_entry(&buf[*consumed..]) {
+                Ok((entry_txs, used)) => {
+                    txs.extend(entry_txs);
+                    *consumed += used;
+                }
+                // Entry continues in data we have not received yet.
+                Err(EntryError::Truncated) => return txs,
+                Err(EntryError::Malformed) => {
+                    *consumed += 1;
+                    *boundary_scanned = false;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,87 +368,12 @@ impl SlotState {
 
     /// Try to deserialize entries from accumulated data and extract transactions.
     fn try_deserialize(&mut self) -> Vec<VersionedTransaction> {
-        let mut txs = Vec::new();
-
-        loop {
-            // ── Phase 1: locate the first Entry boundary ────────────────────
-            if !self.boundary_scanned {
-                let buf = &self.entry_buf[self.consumed..];
-                if buf.len() < 48 {
-                    return txs;
-                }
-
-                let mut found_at: Option<usize> = None;
-                for off in 0..buf.len().saturating_sub(47) {
-                    let tx_count = u64::from_le_bytes(buf[off + 40..off + 48].try_into().unwrap());
-                    if tx_count > 512 {
-                        continue;
-                    }
-                    // Anchor only on an Entry with transactions, each carrying at
-                    // least one signature: zero-filled bytes easily parse as an
-                    // empty Entry or an unsigned transaction. Skipping real empty
-                    // (tick) Entries here loses nothing.
-                    let mut cur = std::io::Cursor::new(&buf[off..]);
-                    if bincode::deserialize_from::<_, Entry>(&mut cur).is_ok_and(|e| {
-                        !e.transactions.is_empty()
-                            && e.transactions.iter().all(|t| !t.signatures.is_empty())
-                    }) {
-                        found_at = Some(off);
-                        break;
-                    }
-                }
-
-                match found_at {
-                    Some(off) => {
-                        self.consumed += off;
-                        self.boundary_scanned = true;
-                    }
-                    None => {
-                        return txs;
-                    }
-                }
-            }
-
-            // ── Phase 2: stream-deserialize complete Entries ─────────────────
-            let buf = &self.entry_buf[self.consumed..];
-            if buf.is_empty() {
-                return txs;
-            }
-            let mut cursor = std::io::Cursor::new(buf);
-            let resync = loop {
-                let pos_before = cursor.position();
-                match bincode::deserialize_from::<_, Entry>(&mut cursor) {
-                    Ok(entry) => {
-                        txs.extend(entry.transactions);
-                    }
-                    Err(e) if is_truncated(&e) => {
-                        // Entry continues in shreds we have not received yet.
-                        cursor.set_position(pos_before);
-                        break false;
-                    }
-                    Err(_) => {
-                        // An entry we cannot read (e.g. a transaction format this
-                        // build does not know). More shreds will not fix it, and
-                        // waiting would drop the rest of the slot, so step past it
-                        // and rescan for the next Entry boundary.
-                        cursor.set_position(pos_before + 1);
-                        break true;
-                    }
-                }
-            };
-            self.consumed += cursor.position() as usize;
-            if !resync {
-                return txs;
-            }
-            self.boundary_scanned = false;
-        }
+        decode_entries(
+            &self.entry_buf,
+            &mut self.consumed,
+            &mut self.boundary_scanned,
+        )
     }
-}
-
-/// True when bincode ran out of bytes, i.e. the entry is incomplete rather than
-/// malformed.
-fn is_truncated(err: &bincode::Error) -> bool {
-    matches!(err.as_ref(), bincode::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 // ---------------------------------------------------------------------------
@@ -988,7 +1019,7 @@ mod tests {
         assert_eq!(highest_slot, 102);
     }
 
-    use solana_message::{v1, Message, VersionedMessage};
+    use solana_message::{v1, Address, Hash, Message, MessageHeader, VersionedMessage};
     use solana_signature::Signature;
 
     fn tx(seed: u8, message: VersionedMessage) -> VersionedTransaction {
@@ -998,7 +1029,7 @@ mod tests {
         }
     }
 
-    /// Bincode bytes of one Entry holding `txs`, written field by field.
+    /// Wire bytes of one Entry holding `txs`, written field by field.
     fn entry_bytes(txs: &[Vec<u8>]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&1u64.to_le_bytes()); // num_hashes
@@ -1011,7 +1042,7 @@ mod tests {
     }
 
     fn legacy_tx_bytes(seed: u8) -> Vec<u8> {
-        bincode::serialize(&tx(seed, VersionedMessage::Legacy(Message::default()))).unwrap()
+        wincode::serialize(&tx(seed, VersionedMessage::Legacy(Message::default()))).unwrap()
     }
 
     fn slot_with(buf: Vec<u8>) -> SlotState {
@@ -1025,13 +1056,88 @@ mod tests {
         t.signatures[0].into()
     }
 
+    /// A v1 message with one signer, as the network sends it.
+    fn v1_message(seed: u8) -> v1::Message {
+        v1::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            config: v1::TransactionConfig::default(),
+            lifetime_specifier: Hash::new_from_array([seed; 32]),
+            account_keys: vec![Address::new_from_array([seed; 32])],
+            instructions: vec![],
+        }
+    }
+
+    /// SIMD-0385 wire layout of a v1 transaction: the message (starting with
+    /// the 0x81 version byte), then the signatures with no length prefix.
+    fn v1_tx_bytes(seed: u8) -> Vec<u8> {
+        let mut out = v1_message(seed).serialize();
+        out.extend_from_slice(&[seed; 64]);
+        out
+    }
+
     #[test]
-    fn test_v1_transaction_decodes() {
-        let v1_tx = tx(9, VersionedMessage::V1(v1::Message::default()));
-        let mut s = slot_with(entry_bytes(&[bincode::serialize(&v1_tx).unwrap()]));
+    fn test_v1_wire_layout_matches_wincode() {
+        let bytes = v1_tx_bytes(9);
+        assert_eq!(bytes[0], 0x81);
+        let t = tx(9, VersionedMessage::V1(v1_message(9)));
+        assert_eq!(wincode::serialize(&t).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_v1_transaction_decodes_between_legacy_entries() {
+        let mut buf = entry_bytes(&[legacy_tx_bytes(1)]);
+        buf.extend(entry_bytes(&[v1_tx_bytes(9)]));
+        buf.extend(entry_bytes(&[legacy_tx_bytes(2)]));
+
+        let mut s = slot_with(buf);
         let txs = s.try_deserialize();
-        assert_eq!(txs.len(), 1);
-        assert!(matches!(txs[0].message, VersionedMessage::V1(_)));
+        assert_eq!(s.consumed, s.entry_buf.len());
+        let sigs: Vec<[u8; 64]> = txs.iter().map(first_sig_bytes).collect();
+        assert_eq!(sigs, vec![[1u8; 64], [9u8; 64], [2u8; 64]]);
+        assert!(matches!(txs[1].message, VersionedMessage::V1(_)));
+    }
+
+    #[test]
+    fn test_cut_off_v1_transaction_waits_for_more_shreds() {
+        let first = entry_bytes(&[legacy_tx_bytes(1)]);
+        let second = entry_bytes(&[v1_tx_bytes(9)]);
+
+        // Cut inside the message and inside the trailing signature.
+        for split in [60, second.len() - 10] {
+            let mut buf = first.clone();
+            buf.extend_from_slice(&second[..split]);
+            let mut s = slot_with(buf);
+            assert_eq!(s.try_deserialize().len(), 1);
+            assert_eq!(s.consumed, first.len());
+
+            s.entry_buf.extend_from_slice(&second[split..]);
+            let txs = s.try_deserialize();
+            assert_eq!(txs.len(), 1);
+            assert_eq!(first_sig_bytes(&txs[0]), [9u8; 64]);
+        }
+    }
+
+    #[test]
+    fn test_jito_batch_keeps_entries_after_unreadable_one() {
+        let mut bad_tx = vec![1u8];
+        bad_tx.extend_from_slice(&[0xaa; 64]);
+        bad_tx.push(0xff);
+        bad_tx.extend_from_slice(&[0x11; 40]);
+
+        let mut batch = 3u64.to_le_bytes().to_vec();
+        batch.extend(entry_bytes(&[legacy_tx_bytes(1)]));
+        batch.extend(entry_bytes(&[bad_tx]));
+        batch.extend(entry_bytes(&[v1_tx_bytes(9)]));
+
+        let sigs: Vec<[u8; 64]> = read_entry_batch(&batch)
+            .iter()
+            .map(first_sig_bytes)
+            .collect();
+        assert_eq!(sigs, vec![[1u8; 64], [9u8; 64]]);
     }
 
     #[test]
