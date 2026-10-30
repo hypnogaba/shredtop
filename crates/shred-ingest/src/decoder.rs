@@ -12,7 +12,7 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use solana_transaction::versioned::VersionedTransaction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
@@ -65,66 +65,94 @@ pub(crate) fn read_entry(buf: &[u8]) -> Result<(Vec<VersionedTransaction>, usize
 /// Read a `Vec<Entry>` as the Jito proxy sends it (u64 count, then Entries).
 /// An unreadable Entry is skipped; the Entries after it are still read.
 pub(crate) fn read_entry_batch(buf: &[u8]) -> Vec<VersionedTransaction> {
-    if buf.len() < 8 {
-        return Vec::new();
-    }
-    // The Entry count is not needed: the batch ends where the bytes end.
     let mut consumed = 0;
     let mut boundary_scanned = true;
-    decode_entries(&buf[8..], &mut consumed, &mut boundary_scanned)
+    let mut batch_starts = VecDeque::from([0]);
+    decode_entries(buf, &mut consumed, &mut boundary_scanned, &mut batch_starts)
 }
 
 /// Decode the complete Entries in `buf[*consumed..]` and advance `consumed`
 /// past them. An Entry cut off at the end of `buf` is left for the next call.
 ///
+/// `buf` is a run of entry batches. Each batch is a u64 Entry count followed
+/// by the Entries (a count of 0 marks a block marker instead, which we skip).
+/// `batch_starts` holds the known batch offsets in `buf`, in order.
+///
 /// When `boundary_scanned` is false, `buf[*consumed..]` may start mid-Entry, so
-/// first scan forward for an Entry header. An unreadable Entry is skipped the
-/// same way: no amount of extra data fixes it, and waiting on it would lose
-/// every Entry after it.
+/// first scan forward for an Entry header or the next batch start. An
+/// unreadable Entry is skipped the same way: no amount of extra data fixes it,
+/// and waiting on it would lose every Entry after it.
 fn decode_entries(
     buf: &[u8],
     consumed: &mut usize,
     boundary_scanned: &mut bool,
+    batch_starts: &mut VecDeque<usize>,
 ) -> Vec<VersionedTransaction> {
     let mut txs = Vec::new();
 
     loop {
+        while batch_starts.front().is_some_and(|&s| s < *consumed) {
+            batch_starts.pop_front();
+        }
+        // Entries never cross into the next batch.
+        let batch_end = batch_starts.front().copied().unwrap_or(buf.len());
+
         // ── Phase 1: locate the first Entry boundary ────────────────────────
         if !*boundary_scanned {
             let rest = &buf[*consumed..];
-            if rest.len() < 48 {
-                return txs;
-            }
+            let limit = (batch_end - *consumed).min(rest.len().saturating_sub(47));
 
             // Anchor only on an Entry with transactions, each carrying at
             // least one signature: zero-filled bytes easily parse as an
             // empty Entry or an unsigned transaction. Skipping real empty
             // (tick) Entries here loses nothing.
-            let found_at = (0..rest.len() - 47).find(|&off| {
-                read_entry(&rest[off..]).is_ok_and(|(entry_txs, _)| {
-                    !entry_txs.is_empty() && entry_txs.iter().all(|t| !t.signatures.is_empty())
+            let found_at = (0..limit).find(|&off| {
+                read_entry(&rest[off..]).is_ok_and(|(entry_txs, used)| {
+                    off + used <= batch_end - *consumed
+                        && !entry_txs.is_empty()
+                        && entry_txs.iter().all(|t| !t.signatures.is_empty())
                 })
             });
 
             match found_at {
-                Some(off) => {
-                    *consumed += off;
-                    *boundary_scanned = true;
-                }
+                Some(off) => *consumed += off,
+                // A batch start is always a boundary.
+                None if batch_end < buf.len() => *consumed = batch_end,
                 None => return txs,
             }
+            *boundary_scanned = true;
         }
 
         // ── Phase 2: decode complete Entries ────────────────────────────────
         loop {
+            if batch_starts.front() == Some(&*consumed) {
+                let Some(count) = buf.get(*consumed..*consumed + 8) else {
+                    return txs;
+                };
+                if u64::from_le_bytes(count.try_into().unwrap()) == 0 {
+                    // Block marker, not Entries: skip to the next batch once
+                    // we know where it starts.
+                    match batch_starts.get(1) {
+                        Some(&next) => *consumed = next,
+                        None => return txs,
+                    }
+                } else {
+                    *consumed += 8;
+                }
+                batch_starts.pop_front();
+                continue;
+            }
+            let batch_end = batch_starts.front().copied();
+
             match read_entry(&buf[*consumed..]) {
-                Ok((entry_txs, used)) => {
+                Ok((entry_txs, used)) if batch_end.is_none_or(|end| *consumed + used <= end) => {
                     txs.extend(entry_txs);
                     *consumed += used;
                 }
                 // Entry continues in data we have not received yet.
-                Err(EntryError::Truncated) => return txs,
-                Err(EntryError::Malformed) => {
+                Err(EntryError::Truncated) if batch_end.is_none() => return txs,
+                // Unreadable, or runs past the end of its batch.
+                _ => {
                     *consumed += 1;
                     *boundary_scanned = false;
                     break;
@@ -150,7 +178,8 @@ fn decode_entries(
 //
 // Data shred header (appended after common header at offset 83):
 //   Bytes  83 ..  84 = parent_offset (u16 LE, not used)
-//   Byte   85        = flags  (bit 0x01 = LAST_SHRED_IN_SLOT)
+//   Byte   85        = flags  (bit 0x01 = LAST_SHRED_IN_SLOT,
+//                              bit 0x40 = DATA_COMPLETE: last shred of an entry batch)
 //   Bytes  86 ..  87 = size   (u16 LE) — absolute end offset of entry data from byte 0
 //                              i.e. data = bytes[88..size]
 //
@@ -178,6 +207,7 @@ const FLAGS_OFF: usize = 85;
 const SIZE_OFF: usize = 86; // u16 LE: absolute end of entry data (bytes[88..size])
 const DATA_OFF: usize = 88; // entry data starts here (same for all data shred types)
 const LAST_IN_SLOT_FLAG: u8 = 0x01;
+const DATA_COMPLETE_FLAG: u8 = 0x40;
 const LEGACY_DATA_VARIANT: u8 = 0xa5;
 
 // Coding shred header fields (after common header at offset 83)
@@ -272,6 +302,12 @@ fn parse_data_payload(bytes: &[u8]) -> Option<(bool, Vec<u8>)> {
     Some((last_in_slot, bytes[DATA_OFF..size].to_vec()))
 }
 
+/// True when this data shred is the last one of an entry batch, so the next
+/// shred starts a new batch.
+fn ends_entry_batch(bytes: &[u8]) -> bool {
+    bytes.len() > FLAGS_OFF && bytes[FLAGS_OFF] & DATA_COMPLETE_FLAG != 0
+}
+
 use crate::receiver::RawShred;
 
 // ---------------------------------------------------------------------------
@@ -326,6 +362,10 @@ struct SlotState {
     /// may contain the tail of an incomplete Entry from earlier shreds.
     /// We scan forward once to skip past it before normal deserialization.
     boundary_scanned: bool,
+    /// Indices of received data shreds that end an entry batch.
+    batch_ends: HashSet<u32>,
+    /// Offsets in entry_buf where an entry batch starts, in order.
+    batch_starts: VecDeque<usize>,
 }
 
 impl SlotState {
@@ -344,6 +384,8 @@ impl SlotState {
             fec_recovered_count: 0,
             counted: false,
             boundary_scanned: false,
+            batch_ends: HashSet::new(),
+            batch_starts: VecDeque::new(),
         }
     }
 
@@ -355,6 +397,9 @@ impl SlotState {
         if self.next_contiguous == u32::MAX {
             self.next_contiguous = idx;
             self.boundary_scanned = idx == 0;
+            if idx == 0 {
+                self.batch_starts.push_back(0);
+            }
         }
     }
 
@@ -362,6 +407,9 @@ impl SlotState {
     fn flush_contiguous(&mut self) {
         while let Some(payload) = self.data_payloads.remove(&self.next_contiguous) {
             self.entry_buf.extend_from_slice(&payload);
+            if self.batch_ends.remove(&self.next_contiguous) {
+                self.batch_starts.push_back(self.entry_buf.len());
+            }
             self.next_contiguous += 1;
         }
     }
@@ -372,6 +420,7 @@ impl SlotState {
             &self.entry_buf,
             &mut self.consumed,
             &mut self.boundary_scanned,
+            &mut self.batch_starts,
         )
     }
 }
@@ -597,6 +646,9 @@ impl ShredDecoder {
                                 if last_in_slot {
                                     slot_state.last_seen = true;
                                 }
+                                if ends_entry_batch(&shard_bytes) {
+                                    slot_state.batch_ends.insert(global_idx);
+                                }
                                 slot_state.data_payloads.insert(global_idx, payload);
                                 recovered_count += 1;
                             }
@@ -696,6 +748,9 @@ impl ShredDecoder {
             }
             if last_in_slot {
                 state.last_seen = true;
+            }
+            if ends_entry_batch(&raw_shred.data) {
+                state.batch_ends.insert(shred_index);
             }
 
             if state.data_payloads.insert(shred_index, payload).is_none() {
@@ -1019,7 +1074,7 @@ mod tests {
         assert_eq!(highest_slot, 102);
     }
 
-    use solana_message::{v1, Address, Hash, Message, MessageHeader, VersionedMessage};
+    use solana_message::{v0, v1, Address, Hash, Message, MessageHeader, VersionedMessage};
     use solana_signature::Signature;
 
     fn tx(seed: u8, message: VersionedMessage) -> VersionedTransaction {
@@ -1041,10 +1096,34 @@ mod tests {
         out
     }
 
+    /// Wire bytes of one entry batch: the Entry count, then the Entries.
+    fn batch(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = (entries.len() as u64).to_le_bytes().to_vec();
+        for e in entries {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
     fn legacy_tx_bytes(seed: u8) -> Vec<u8> {
         wincode::serialize(&tx(seed, VersionedMessage::Legacy(Message::default()))).unwrap()
     }
 
+    fn v0_tx_bytes(seed: u8) -> Vec<u8> {
+        wincode::serialize(&tx(seed, VersionedMessage::V0(v0::Message::default()))).unwrap()
+    }
+
+    /// A transaction with an unknown message version (prefix 0xff). It cannot
+    /// be read no matter how many more shreds arrive.
+    fn bad_tx_bytes() -> Vec<u8> {
+        let mut out = vec![1u8]; // one signature (short_vec)
+        out.extend_from_slice(&[0xaa; 64]);
+        out.push(0xff);
+        out.extend_from_slice(&[0x11; 40]);
+        out
+    }
+
+    /// A slot that starts at shred 0 with `buf` already flushed.
     fn slot_with(buf: Vec<u8>) -> SlotState {
         let mut s = SlotState::new(0);
         s.set_first_index(0);
@@ -1052,8 +1131,10 @@ mod tests {
         s
     }
 
-    fn first_sig_bytes(t: &VersionedTransaction) -> [u8; 64] {
-        t.signatures[0].into()
+    fn sigs(txs: &[VersionedTransaction]) -> Vec<u8> {
+        txs.iter()
+            .map(|t| <[u8; 64]>::from(t.signatures[0])[0])
+            .collect()
     }
 
     /// A v1 message with one signer, as the network sends it.
@@ -1089,91 +1170,140 @@ mod tests {
 
     #[test]
     fn test_v1_transaction_decodes_between_legacy_entries() {
-        let mut buf = entry_bytes(&[legacy_tx_bytes(1)]);
-        buf.extend(entry_bytes(&[v1_tx_bytes(9)]));
-        buf.extend(entry_bytes(&[legacy_tx_bytes(2)]));
-
-        let mut s = slot_with(buf);
+        let mut s = slot_with(batch(&[
+            entry_bytes(&[legacy_tx_bytes(1)]),
+            entry_bytes(&[v1_tx_bytes(9)]),
+            entry_bytes(&[legacy_tx_bytes(2)]),
+        ]));
         let txs = s.try_deserialize();
         assert_eq!(s.consumed, s.entry_buf.len());
-        let sigs: Vec<[u8; 64]> = txs.iter().map(first_sig_bytes).collect();
-        assert_eq!(sigs, vec![[1u8; 64], [9u8; 64], [2u8; 64]]);
+        assert_eq!(sigs(&txs), vec![1, 9, 2]);
         assert!(matches!(txs[1].message, VersionedMessage::V1(_)));
+    }
+
+    #[test]
+    fn test_every_cut_reads_as_truncated() {
+        for tx_bytes in [legacy_tx_bytes(1), v0_tx_bytes(2), v1_tx_bytes(3)] {
+            let entry = entry_bytes(&[tx_bytes]);
+            for cut in 0..entry.len() {
+                assert_eq!(read_entry(&entry[..cut]), Err(EntryError::Truncated));
+            }
+            let (txs, used) = read_entry(&entry).unwrap();
+            assert_eq!(txs.len(), 1);
+            assert_eq!(used, entry.len());
+        }
     }
 
     #[test]
     fn test_cut_off_v1_transaction_waits_for_more_shreds() {
         let first = entry_bytes(&[legacy_tx_bytes(1)]);
-        let second = entry_bytes(&[v1_tx_bytes(9)]);
+        let full = batch(&[first.clone(), entry_bytes(&[v1_tx_bytes(9)])]);
+        let first_end = 8 + first.len();
 
-        // Cut inside the message and inside the trailing signature.
-        for split in [60, second.len() - 10] {
-            let mut buf = first.clone();
-            buf.extend_from_slice(&second[..split]);
-            let mut s = slot_with(buf);
-            assert_eq!(s.try_deserialize().len(), 1);
-            assert_eq!(s.consumed, first.len());
+        for cut in first_end + 1..full.len() {
+            let mut s = slot_with(full[..cut].to_vec());
+            assert_eq!(sigs(&s.try_deserialize()), vec![1]);
+            assert_eq!(s.consumed, first_end);
 
-            s.entry_buf.extend_from_slice(&second[split..]);
-            let txs = s.try_deserialize();
-            assert_eq!(txs.len(), 1);
-            assert_eq!(first_sig_bytes(&txs[0]), [9u8; 64]);
+            s.entry_buf.extend_from_slice(&full[cut..]);
+            assert_eq!(sigs(&s.try_deserialize()), vec![9]);
+            assert_eq!(s.consumed, full.len());
         }
     }
 
     #[test]
-    fn test_jito_batch_keeps_entries_after_unreadable_one() {
-        let mut bad_tx = vec![1u8];
-        bad_tx.extend_from_slice(&[0xaa; 64]);
-        bad_tx.push(0xff);
-        bad_tx.extend_from_slice(&[0x11; 40]);
+    fn test_batches_split_across_shreds() {
+        // Real shred layout: each entry batch starts with its Entry count, a
+        // batch can span shreds, and the shred ending a batch says so. A count
+        // of 0 marks a block marker, which carries no Entries.
+        let batch1 = batch(&[
+            entry_bytes(&[legacy_tx_bytes(1), v0_tx_bytes(2)]),
+            entry_bytes(&[v1_tx_bytes(3)]),
+        ]);
+        let mut marker = 0u64.to_le_bytes().to_vec();
+        marker.extend_from_slice(&[0x5a; 50]);
+        let batch2 = batch(&[entry_bytes(&[v1_tx_bytes(4)])]);
 
-        let mut batch = 3u64.to_le_bytes().to_vec();
-        batch.extend(entry_bytes(&[legacy_tx_bytes(1)]));
-        batch.extend(entry_bytes(&[bad_tx]));
-        batch.extend(entry_bytes(&[v1_tx_bytes(9)]));
+        let cut = 30; // inside the first Entry of batch 1
+        let shreds: Vec<(Vec<u8>, bool)> = vec![
+            (batch1[..cut].to_vec(), false),
+            (batch1[cut..].to_vec(), true),
+            (marker, true),
+            (batch2, true),
+        ];
 
-        let sigs: Vec<[u8; 64]> = read_entry_batch(&batch)
-            .iter()
-            .map(first_sig_bytes)
-            .collect();
-        assert_eq!(sigs, vec![[1u8; 64], [9u8; 64]]);
+        let mut s = SlotState::new(0);
+        s.set_first_index(0);
+        let mut got = Vec::new();
+        for (idx, (payload, ends_batch)) in shreds.into_iter().enumerate() {
+            s.data_payloads.insert(idx as u32, payload);
+            if ends_batch {
+                s.batch_ends.insert(idx as u32);
+            }
+            s.flush_contiguous();
+            got.extend(s.try_deserialize());
+        }
+        assert_eq!(sigs(&got), vec![1, 2, 3, 4]);
+        assert_eq!(s.consumed, s.entry_buf.len());
+    }
+
+    #[test]
+    fn test_mid_slot_start_with_v1() {
+        // Relays may start mid-block: the buffer opens with the tail of an
+        // Entry whose start we never saw.
+        let lost = entry_bytes(&[legacy_tx_bytes(7)]);
+        let mut buf = lost[lost.len() / 2..].to_vec();
+        buf.extend(entry_bytes(&[legacy_tx_bytes(1)]));
+        buf.extend(entry_bytes(&[v1_tx_bytes(9)]));
+
+        let mut s = SlotState::new(0);
+        s.set_first_index(5);
+        s.entry_buf = buf;
+        assert_eq!(sigs(&s.try_deserialize()), vec![1, 9]);
     }
 
     #[test]
     fn test_unreadable_entry_does_not_drop_rest_of_slot() {
-        // A transaction with an unknown message version (prefix 0xff) cannot be
-        // read no matter how many more shreds arrive. The entries after it must
-        // still be decoded.
-        let mut bad_tx = vec![1u8]; // one signature (short_vec)
-        bad_tx.extend_from_slice(&[0xaa; 64]);
-        bad_tx.push(0xff);
-        bad_tx.extend_from_slice(&[0x11; 40]);
-
-        let mut buf = entry_bytes(&[legacy_tx_bytes(1)]);
-        buf.extend(entry_bytes(&[bad_tx]));
-        buf.extend(entry_bytes(&[legacy_tx_bytes(2)]));
-
-        let mut s = slot_with(buf);
-        let sigs: Vec<[u8; 64]> = s.try_deserialize().iter().map(first_sig_bytes).collect();
-        assert_eq!(sigs, vec![[1u8; 64], [2u8; 64]]);
+        let mut s = slot_with(batch(&[
+            entry_bytes(&[legacy_tx_bytes(1)]),
+            entry_bytes(&[bad_tx_bytes()]),
+            entry_bytes(&[legacy_tx_bytes(2)]),
+        ]));
+        assert_eq!(sigs(&s.try_deserialize()), vec![1, 2]);
     }
 
     #[test]
     fn test_incomplete_entry_waits_for_more_shreds() {
         let first = entry_bytes(&[legacy_tx_bytes(1)]);
         let second = entry_bytes(&[legacy_tx_bytes(2)]);
-        let split = second.len() / 2;
+        let full = batch(&[first.clone(), second.clone()]);
+        let split = 8 + first.len() + second.len() / 2;
 
-        let mut buf = first.clone();
-        buf.extend_from_slice(&second[..split]);
-        let mut s = slot_with(buf);
-        assert_eq!(s.try_deserialize().len(), 1);
-        assert_eq!(s.consumed, first.len());
+        let mut s = slot_with(full[..split].to_vec());
+        assert_eq!(sigs(&s.try_deserialize()), vec![1]);
+        assert_eq!(s.consumed, 8 + first.len());
 
-        s.entry_buf.extend_from_slice(&second[split..]);
-        let txs = s.try_deserialize();
-        assert_eq!(txs.len(), 1);
-        assert_eq!(first_sig_bytes(&txs[0]), [2u8; 64]);
+        s.entry_buf.extend_from_slice(&full[split..]);
+        assert_eq!(sigs(&s.try_deserialize()), vec![2]);
+    }
+
+    #[test]
+    fn test_jito_batch_keeps_entries_after_unreadable_one() {
+        let b = batch(&[
+            entry_bytes(&[legacy_tx_bytes(1)]),
+            entry_bytes(&[bad_tx_bytes()]),
+            entry_bytes(&[v1_tx_bytes(9)]),
+        ]);
+        assert_eq!(sigs(&read_entry_batch(&b)), vec![1, 9]);
+    }
+
+    #[test]
+    fn test_jito_batch_with_unreadable_first_entry() {
+        let b = batch(&[
+            entry_bytes(&[bad_tx_bytes()]),
+            entry_bytes(&[legacy_tx_bytes(1)]),
+            entry_bytes(&[v1_tx_bytes(9)]),
+        ]);
+        assert_eq!(sigs(&read_entry_batch(&b)), vec![1, 9]);
     }
 }
